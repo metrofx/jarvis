@@ -1,0 +1,15 @@
+[project]
+name = "jarvis"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "elevenlabs>=2.29.0",
+    "google-genai>=1.57.0",
+    "pyaudio>=0.2.14",
+    "pyside6>=6.10.1",
+    "python-dotenv>=1.2.1",
+    "rich>=14.2.0",
+    "websockets>=15.0.1",
+]
