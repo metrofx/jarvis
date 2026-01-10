@@ -30,7 +30,7 @@ This repository contains the source code for Jarvis, a conversational AI assista
     ```bash
     uv sync
     ```
-    *(Note: You may need to install uv as python package manager.)*
+    *(Note: You may need to install [uv](https://docs.astral.sh/uv/#installation) as python package manager.)*
 
 3.  **Set up your API keys:**
     Create a `.env` file in the root of the project and add your API keys for Google Gemini and ElevenLabs:
@@ -46,7 +46,7 @@ This repository contains the source code for Jarvis, a conversational AI assista
 To run the command-line interface, execute the following command:
 
 ```bash
-python cli.py
+uv run cli.py
 ```
 
 You can then type your messages in the console and press Enter to chat with Jarvis. To exit, type `exit`.
@@ -56,7 +56,7 @@ You can then type your messages in the console and press Enter to chat with Jarv
 To launch the graphical user interface, run:
 
 ```bash
-python main.py
+uv run main.py
 ```
 
 This will open a window where you can interact with Jarvis. The GUI provides a more immersive experience with voice responses.
