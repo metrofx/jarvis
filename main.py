@@ -15,28 +15,28 @@ from PySide6.QtWidgets import QApplication, QMainWindow, QTextEdit, QVBoxLayout,
 from PySide6.QtCore import QObject, Signal, Slot
 
 # --- AI Imports ---
-from google import genai
-from google.genai import types
+from openai import OpenAI
 from dotenv import load_dotenv
 
 # --- Load Environment Variables ---
 load_dotenv()
 ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 
-if not GEMINI_API_KEY:
-    sys.exit("Error: GEMINI_API_KEY not found. Please set it in your .env file.")
+if not OPENROUTER_API_KEY:
+    sys.exit("Error: OPENROUTER_API_KEY not found. Please set it in your .env file.")
 if not ELEVENLABS_API_KEY:
     sys.exit("Error: ELEVENLABS_API_KEY not found. Please check your .env file.")
 
 # --- Configuration ---
 RECEIVE_SAMPLE_RATE = 24000
-MODEL = "gemini-2.5-flash-lite"
+MODEL = os.getenv("OPENROUTER_MODEL", "google/gemini-2.0-flash-lite-001")
 VOICE_ID = 'SnAS1AhU43gJHbuUJIdM'
+MAX_TOOL_ROUNDS = 3
 
-# ==============================================================================
+# ====
 # AI BACKEND LOGIC
-# ==============================================================================
+# ====
 class AI_Core(QObject):
     """
     Handles all backend operations. Inherits from QObject to emit signals
@@ -48,52 +48,67 @@ class AI_Core(QObject):
     def __init__(self):
         super().__init__()
         self.is_running = True
-        self.client = genai.Client(api_key=GEMINI_API_KEY)
-        self.system_instruction = ( 
-            "Your name is Jarvis. You have a joking sarcastic personality and are an AI designed to help me with technical knowledge as well as day to day task. Address me as Sir and speak in a British accent. Also keep replies short.\n"
+        
+        self.client = OpenAI(
+            base_url="https://openrouter.ai/api/v1",
+            api_key=OPENROUTER_API_KEY,
+            default_headers={
+                "HTTP-Referer": "http://localhost",
+                "X-Title": "Jarvis GUI",
+            },
+        )
+        
+        self.system_instruction = (
+            "Your name is Jarvis. You have a joking sarcastic personality and are an AI designed "
+            "to help me with technical knowledge as well as day to day task. Address me as Sir "
+            "and speak in a British accent. Also keep replies short.\n\n"
             "Tool use:\n"
-            "- If the user asks for today's date (or current date), call get_today_date."
+            "- If the user asks for the current date or time (or 'today'), call get_current_datetime.\n"
         )
         
         self.response_queue_tts = asyncio.Queue()
         self.audio_in_queue_player = asyncio.Queue()
         self.text_input_queue = asyncio.Queue()
-        self.conversation_history = [] # list[types.Content]
+        
+        # OpenAI-style message history
+        self.messages = [{"role": "system", "content": self.system_instruction}]
+        
         self.tasks = []
         self.loop = asyncio.new_event_loop()
         self.tools = self._build_tools()
 
-    def get_today_date(self, timezone: str = "Asia/Jakarta") -> dict:
-        # Hardcode the timezone here so it's impossible to override
-        timezone = "Asia/Jakarta"
-        dt = datetime.now(ZoneInfo(timezone))
-        nice = f"Today is {dt:%A}, {dt.day} {dt:%B} {dt:%Y}"
+    def get_current_datetime(self) -> dict:
+        """Get current date and time in Asia/Jakarta timezone."""
+        tz = "Asia/Jakarta"  # hardcoded
+        dt = datetime.now(ZoneInfo(tz))
+        nice = f"It is {dt:%A}, {dt.day} {dt:%B} {dt:%Y}, {dt:%H:%M:%S} ({tz})"
         return {
             "text": nice,
             "iso": dt.isoformat(),
-            "timezone": timezone,
+            "timezone": tz,
         }
 
     def _build_tools(self):
+        """Build OpenAI-style tool definitions."""
         return [
-            types.Tool(
-                function_declarations=[
-                    types.FunctionDeclaration(
-                        name="get_today_date",
-                        description="Get today's date in Asia/Jakarta timezone.",
-                        parameters=types.Schema(
-                            type="OBJECT",
-                            properties={}, # Remove the timezone property
-                            required=[],
-                        ),
-                    )
-                ]
-            )
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_current_datetime",
+                    "description": "Get the current date and time in Asia/Jakarta timezone.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {},
+                        "required": [],
+                    },
+                },
+            }
         ]
 
     def _dispatch_tool(self, name: str, args: dict) -> dict:
-        if name == "get_today_date":
-            return self.get_today_date(**(args or {}))
+        """Execute tool by name."""
+        if name == "get_current_datetime":
+            return self.get_current_datetime()
         raise ValueError(f"Unknown tool: {name}")
 
     async def process_text_input_queue(self):
@@ -111,60 +126,48 @@ class AI_Core(QObject):
                 while not q.empty():
                     q.get_nowait()
             
-            # Add user message to conversation history (TYPED)
-            self.conversation_history.append(
-                types.Content(role="user", parts=[types.Part(text=text)])
-            )
+            # Add user message to conversation history
+            self.messages.append({"role": "user", "content": text})
 
             try:
                 final_text = None
 
                 # Tool loop: model -> (maybe tool call) -> tool response -> model ...
-                for _ in range(3):  # prevent infinite loops
+                for _ in range(MAX_TOOL_ROUNDS):
                     response = await asyncio.to_thread(
-                        self.client.models.generate_content,
+                        self.client.chat.completions.create,
                         model=MODEL,
-                        contents=self.conversation_history,
-                        config={
-                            "system_instruction": self.system_instruction,
-                            "temperature": 0.7,
-                            "tools": self.tools,
-                        },
+                        messages=self.messages,
+                        tools=self.tools,
+                        tool_choice="auto",
                     )
 
-                    model_content = response.candidates[0].content
-                    self.conversation_history.append(model_content)
+                    msg = response.choices[0].message
 
-                    # Check for function calls
-                    function_calls = []
-                    for p in (model_content.parts or []):
-                        fc = getattr(p, "function_call", None)
-                        if fc:
-                            function_calls.append(fc)
+                    # Add assistant message to history (includes tool_calls if any)
+                    self.messages.append(msg.model_dump(exclude_none=True))
 
-                    # No tool call -> this is the final answer
-                    if not function_calls:
-                        texts = [p.text for p in (model_content.parts or []) if getattr(p, "text", None)]
-                        final_text = "".join(texts).strip()
-                        break
+                    # Check for tool calls
+                    if msg.tool_calls:
+                        for tc in msg.tool_calls:
+                            tool_name = tc.function.name
+                            tool_args = json.loads(tc.function.arguments or "{}")
+                            
+                            print(f">>> [TOOL] Calling {tool_name} with args: {tool_args}")
+                            tool_result = self._dispatch_tool(tool_name, tool_args)
+                            print(f">>> [TOOL] Result: {tool_result}")
 
-                    # Execute tool calls and append tool responses
-                    for fc in function_calls:
-                        print(f">>> [TOOL] Calling {fc.name} with args: {fc.args}")
-                        tool_result = self._dispatch_tool(fc.name, fc.args)
-                        print(f">>> [TOOL] Result: {tool_result}")
+                            # Append tool result to messages
+                            self.messages.append({
+                                "role": "tool",
+                                "tool_call_id": tc.id,
+                                "content": json.dumps(tool_result),
+                            })
+                        continue  # Loop again to get final response
 
-                        self.conversation_history.append(
-                            types.Content(
-                                role="user",
-                                parts=[
-                                    types.Part.from_function_response(
-                                        name=fc.name,
-                                        response=tool_result
-                                    )
-                                ],
-                            )
-                        )
+                    # No tool calls -> this is the final answer
+                    final_text = (msg.content or "").strip()
+                    break
 
                 if not final_text:
                     final_text = "Sorry Sir, I'm having trouble fetching that right now."
@@ -181,6 +184,7 @@ class AI_Core(QObject):
             except Exception as e:
                 error_msg = f"Error generating response: {str(e)}"
                 print(f">>> [ERROR] {error_msg}")
+                traceback.print_exc()
                 self.text_received.emit(error_msg)
                 self.end_of_turn.emit()
             
@@ -216,7 +220,7 @@ class AI_Core(QObject):
 
                     listen_task = asyncio.create_task(listen())
                     
-                    # Send the entire text at once (not streaming from Gemini anymore)
+                    # Send the entire text at once
                     await websocket.send(json.dumps({"text": text_chunk + " "}))
                     
                     # Signal end of text
@@ -300,15 +304,15 @@ class AI_Core(QObject):
             except Exception as e:
                 print(f">>> [ERROR] Timeout or error during async shutdown: {e}")
 
-# ==============================================================================
+# ====
 # GUI APPLICATION
-# ==============================================================================
+# ====
 class MainWindow(QMainWindow):
     user_text_submitted = Signal(str)
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Jarvis AI Assistant")
+        self.setWindowTitle("Jarvis AI Assistant (OpenRouter)")
         self.setGeometry(100, 100, 800, 600)
         self.setStyleSheet("background-color: #2b2b2b; color: #f0f0f0;")
 
@@ -319,12 +323,12 @@ class MainWindow(QMainWindow):
         self.main_layout.setContentsMargins(10, 10, 10, 10)
         self.main_layout.setSpacing(10)
 
-        # Chat Display #3c3f41
+        # Chat Display
         self.text_display = QTextEdit()
         self.text_display.setReadOnly(True)
         self.text_display.setStyleSheet("""
-            QTextEdit { background-color: #000000; color: #a9b7c6;
-                        font-size: 16px; border: 1px solid #555; border-radius: 5px; }""")
+            QTextEdit { background-color: #0000; color: #a9b7c6;
+                    font-size: 16px; border: 1px solid #555; border-radius: 5px; }""")
         self.main_layout.addWidget(self.text_display)
 
         # Input Box
@@ -332,7 +336,7 @@ class MainWindow(QMainWindow):
         self.input_box.setPlaceholderText("Type your message to Jarvis here and press Enter...")
         self.input_box.setStyleSheet("""
             QLineEdit { background-color: #3c3f41; color: #a9b7c6; font-size: 14px;
-                        border: 1px solid #555; border-radius: 5px; padding: 5px; }""")
+                    border: 1px solid #555; border-radius: 5px; padding: 5px; }""")
         self.input_box.returnPressed.connect(self.send_user_text)
         self.main_layout.addWidget(self.input_box)
         self.input_box.setFocus()
@@ -356,7 +360,7 @@ class MainWindow(QMainWindow):
             self.text_display.append(f"<b style='color:#6DAEED;'>You:</b> {text}")
             self.user_text_submitted.emit(text)
             self.input_box.clear()
-            self.input_box.setFocus() # Ensure focus stays here after sending
+            self.input_box.setFocus()
 
     @Slot(str)
     def update_text(self, text):
@@ -367,16 +371,16 @@ class MainWindow(QMainWindow):
     @Slot()
     def add_newline(self):
         """Called at the end of Jarvis's turn."""
-        pass  # Not needed anymore since we display complete responses
+        pass
 
     def closeEvent(self, event):
         print(">>> [INFO] Closing application...")
         self.ai_core.stop()
         event.accept()
 
-# ==============================================================================
+# ====
 # MAIN EXECUTION
-# ==============================================================================
+# ====
 if __name__ == "__main__":
     try:
         app = QApplication(sys.argv)
