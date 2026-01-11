@@ -1,64 +1,127 @@
-from google import genai
-from google.genai import types
-import os  
-from dotenv import load_dotenv 
-import rich
+import os
+import json
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
+from dotenv import load_dotenv
 from rich.console import Console
+from openai import OpenAI
 
 console = Console()
-
 load_dotenv()
 
-api_key = os.getenv("GEMINI_API_KEY")
+api_key = os.getenv("OPENROUTER_API_KEY")
+if not api_key:
+    raise ValueError("OPENROUTER_API_KEY not found. Please set it in your .env file.")
 
-client = genai.Client(api_key=api_key)  # Creates a client instance for the Gemini API
+model = os.getenv("OPENROUTER_MODEL", "google/gemini-2.0-flash-lite-001")
 
-# Check if the key was loaded successfully
-if not api_key:                
-    raise ValueError("GEMINI_API_KEY not found. Please set it in your .env file.")
+client = OpenAI(
+    base_url="https://openrouter.ai/api/v1",
+    api_key=api_key,
+    default_headers={
+        "HTTP-Referer": "http://localhost",  # optional
+        "X-Title": "Jarvis CLI",             # optional
+    },
+)
 
-#print("Successfully configured Gemini with API key.")
+# ---- Tool implementations ----
+def get_current_datetime() -> dict:
+    tz = "Asia/Jakarta"  # hardcoded so it cannot be overridden
+    dt = datetime.now(ZoneInfo(tz))
+    nice = f"It is {dt:%A}, {dt.day} {dt:%B} {dt:%Y}, {dt:%H:%M:%S} ({tz})"
+    return {
+        "text": nice,
+        "iso": dt.isoformat(),
+        "timezone": tz,
+    }
 
-def clear_terminal():
-    # For Windows
-    if os.name == 'nt':
-        _ = os.system('cls')
-    # For macOS and Linux
-    else:
-        _ = os.system('clear')
+def dispatch_tool(name: str, args: dict) -> dict:
+    if name == "get_current_datetime":
+        return get_current_datetime()
+    raise ValueError(f"Unknown tool: {name}")
 
-# Call this function right at the start of your script
-#clear_terminal()
+TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_current_datetime",
+            "description": "Get the current date and time in Asia/Jakarta timezone.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+        },
+    }
+]
 
-chat = client.chats.create(model="gemini-2.5-flash-lite",
-                           config=types.GenerateContentConfig(
-                               system_instruction="Your name is Jarvis. You have a joking sarcastic personality and are an AI designed to help me with technical knowledge as well as day to day task. Address me as Sir and speak in a British accent. Also keep replies short.", 
-                               thinking_config=types.ThinkingConfig(thinking_budget=0) # Disables the model's "thinking" process for faster results
-                            )
-                        )
+system_prompt = (
+    "Your name is Jarvis. You have a joking sarcastic personality and are an AI designed "
+    "to help me with technical knowledge as well as day to day task. Address me as Sir "
+    "and speak in a British accent. Also keep replies short.\n\n"
+    "Tool use:\n"
+    "- If the user asks for the current date or time (or 'today'), call get_current_datetime.\n"
+)
 
-# Start an infinite loop to allow for continuous conversation.
+messages = [{"role": "system", "content": system_prompt}]
+
+MAX_TOOL_ROUNDS = 3
+
 while True:
     try:
         user_input = console.input("[bold]You:[/bold] ")
-        
+
         if user_input.lower() == "exit":
             print("Ending chat. Goodbye!")
             break
 
-        # Send the user's input to the model and enable streaming.
-        response = chat.send_message_stream(user_input)
+        messages.append({"role": "user", "content": user_input})
 
-        console.print("[bold green]Gemini:[/bold green] ", end="")
-        for chunk in response:
-            print(chunk.text, end="", flush=True)
-        print("\n") # Print a newline after the full response is received.
+        final_text = None
+
+        for _ in range(MAX_TOOL_ROUNDS):
+            resp = client.chat.completions.create(
+                model=model,
+                messages=messages,
+                tools=TOOLS,
+                tool_choice="auto",
+            )
+
+            msg = resp.choices[0].message
+
+            # Important: add the assistant message to history (includes tool_calls if any)
+            messages.append(msg.model_dump(exclude_none=True))
+
+            # If the model requested tool calls, execute them and continue the loop
+            if msg.tool_calls:
+                for tc in msg.tool_calls:
+                    tool_name = tc.function.name
+                    tool_args = json.loads(tc.function.arguments or "{}")
+
+                    tool_result = dispatch_tool(tool_name, tool_args)
+
+                    # Tool result must be a string, JSON is a good pattern
+                    messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": tc.id,
+                            "content": json.dumps(tool_result),
+                        }
+                    )
+                continue
+
+            # No tool calls, so we have the final assistant response
+            final_text = (msg.content or "").strip()
+            break
+
+        if not final_text:
+            final_text = "Sorry Sir, I couldn't complete that request."
+
+        console.print(f"[bold green]Jarvis:[/bold green] {final_text}\n")
 
     except KeyboardInterrupt:
         print("\nEnding chat. Cheerio!")
-        # Perform any cleanup or exit gracefully
-        # sys.exit(0) # Or just 'break' if you want to exit the loop gracefully
         break
     except Exception as e:
-        # Catch any exceptions and print an error message.
         print(f"An error occurred: {e}")
